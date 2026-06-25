@@ -1,0 +1,304 @@
+# Practical State Management in Flutter with Bloc — Patterns, Performance, and Real-World Tips
+
+A concise, practical reference for mid-level Flutter developers using flutter_bloc in production. Focus: patterns, performance, testability, and maintainability — with clear examples and anti-patterns.
+
+## When to use Bloc
+Use Bloc for features with:
+- Complex flows, side effects, or offline sync (auth, pagination, multi-step forms).
+- Requirements for deterministic state transitions and robust tests.
+Avoid Bloc for trivial, localized UI state (simple animations, a button + text). Use StatefulWidget, Provider, or Riverpod there.
+
+## Core concepts (quick)
+- Event: intent (e.g., LoginRequested).
+- State: immutable snapshot describing UI/model.
+- Bloc: accepts events, calls repositories/services, emits states.
+- on<Event> (or mapEventToState) handles events; emit new states.
+- Expose state as stream; use Equatable or value equality to avoid redundant rebuilds.
+- Close blocs when no longer used (BlocProvider disposes by default).
+
+## Project structure (recommended)
+Small/feature-first:
+- lib/features/<feature>/{<feature>_bloc.dart, <feature>_event.dart, <feature>_state.dart, repository.dart, views/}
+
+Medium:
+- lib/modules/<feature>/... plus core/ and shared/
+
+Large:
+- layer-first: data / domain / presentation with clear feature boundaries.
+
+Where to put things:
+- Blocs: presentation/feature folder
+- Repositories: data/domain
+- Models: domain/shared
+- Widgets: thin UI only
+
+## flutter_bloc widgets & usage (practical)
+- BlocProvider: provide bloc instance.
+- BlocBuilder: rebuild UI from state.
+- BlocListener: react to one-off effects (navigation, toasts).
+- BlocConsumer: Builder + Listener.
+- BlocSelector: select slice of state to avoid rebuilds.
+
+Best practices:
+- Use BlocSelector to rebuild only necessary widgets.
+- Use context.read<T>() to access bloc/repo outside build; use context.watch<T>() only when you need rebuilds.
+- Avoid BlocProvider.value unless you intentionally reuse an existing instance.
+
+Example: avoid unnecessary rebuilds
+```dart
+BlocSelector<CounterBloc, CounterState, int>(
+  selector: (state) => state.value,
+  builder: (context, count) => Text('$count'),
+)
+```
+
+## Minimal Counter example (complete)
+counter_event.dart
+```dart
+abstract class CounterEvent {}
+class CounterIncremented extends CounterEvent {}
+```
+
+counter_state.dart
+```dart
+import 'package:equatable/equatable.dart';
+
+class CounterState extends Equatable {
+  final int value;
+  const CounterState(this.value);
+
+  @override
+  List<Object?> get props => [value];
+}
+```
+
+counter_bloc.dart
+```dart
+import 'package:bloc/bloc.dart';
+
+class CounterBloc extends Bloc<CounterEvent, CounterState> {
+  CounterBloc() : super(const CounterState(0)) {
+    on<CounterIncremented>((_, emit) => emit(CounterState(state.value + 1)));
+  }
+}
+```
+
+Usage:
+```dart
+BlocProvider(
+  create: (_) => CounterBloc(),
+  child: BlocBuilder<CounterBloc, CounterState>(
+    builder: (context, state) => Text('Count: ${state.value}'),
+  ),
+);
+```
+
+## State modeling & performance
+- Keep state granular: several small fields vs one large mutable blob.
+- Use Equatable (or value equality) so identical states don't trigger rebuilds.
+- Extract big widget subtrees into separate widgets and use BlocSelector for slices.
+- Offload heavy computation to isolates (compute) or background services.
+- Debounce or throttle frequent events (scroll, search input).
+
+Example ProfileState
+```dart
+class ProfileState extends Equatable {
+  final bool loading;
+  final User? user;
+  final String? error;
+
+  const ProfileState({this.loading = false, this.user, this.error});
+
+  @override
+  List<Object?> get props => [loading, user, error];
+}
+```
+
+Performance pitfalls:
+- Emitting identical states (no value equality).
+- Blocking main isolate in handlers.
+- Flooding events without debouncing.
+
+## Side effects, navigation & one-off events
+- Do UI side effects in BlocListener, not in build, not inside state classes.
+- For one-off effects use one of:
+  - Status field in state consumed by BlocListener (then reset),
+  - Separate side-effect bloc,
+  - Carefully chosen single-consumption helper (use with caution).
+
+Example navigation:
+```dart
+BlocListener<AuthBloc, AuthState>(
+  listener: (context, state) {
+    if (state is AuthAuthenticated) {
+      Navigator.of(context).pushReplacementNamed('/home');
+    } else if (state is AuthError) {
+      ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(state.message)));
+    }
+  },
+  child: LoginView(),
+)
+```
+
+Do not call Navigator in mapEventToState/on handlers; keep UI reactions in listeners.
+
+## Persistence & HydratedBloc
+HydratedBloc persists state; implement toJson/fromJson.
+
+Example:
+```dart
+class CounterHydratedBloc extends HydratedBloc<CounterEvent, CounterState> {
+  CounterHydratedBloc() : super(const CounterState(0)) {
+    on<CounterIncremented>((_, emit) => emit(CounterState(state.value + 1)));
+  }
+
+  @override
+  CounterState? fromJson(Map<String, dynamic> json) => CounterState(json['value'] as int);
+
+  @override
+  Map<String, dynamic>? toJson(CounterState state) => {'value': state.value};
+}
+```
+
+Considerations:
+- Do not persist secrets without encryption.
+- Add a version field to persisted JSON and handle migrations in fromJson.
+- For tokens use secure storage and custom HydratedStorage if needed.
+
+## Pagination (infinite scroll) — pattern
+Key points: avoid duplicate loads, debounce scroll events, preserve items.
+
+pagination_bloc.dart (core)
+```dart
+class PaginationBloc extends Bloc<PaginationEvent, PaginationState> {
+  final Repo repo;
+  int page = 0;
+
+  PaginationBloc(this.repo) : super(const PaginationState()) {
+    on<FetchNextPage>(_onFetchNextPage, transformer: debounce(const Duration(milliseconds: 300)));
+  }
+
+  Future<void> _onFetchNextPage(FetchNextPage _, Emitter<PaginationState> emit) async {
+    if (state.loading || state.hasReachedEnd) return;
+    emit(PaginationState(items: state.items, loading: true, hasReachedEnd: state.hasReachedEnd));
+    final newItems = await repo.fetchPage(++page);
+    final all = List.of(state.items)..addAll(newItems);
+    emit(PaginationState(items: all, loading: false, hasReachedEnd: newItems.isEmpty));
+  }
+}
+```
+Implement a debounce transformer (see bloc_concurrency utilities or write a simple transformer).
+
+## Forms & validation (practical)
+- Options:
+  - Per-field events + per-field small state to minimize rebuilds.
+  - Single form state (simpler, may rebuild more).
+- Use BlocSelector for per-field widgets.
+- Keep validation logic in Bloc/domain, not in UI.
+
+## Authentication example (compact)
+auth_event.dart / auth_state.dart / auth_bloc.dart as pattern below: bloc accepts LoginRequested, emits AuthLoading then AuthAuthenticated or AuthError. Keep token storage in repo.
+
+auth_bloc snippet:
+```dart
+on<LoginRequested>((e, emit) async {
+  emit(AuthLoading());
+  try {
+    final user = await repo.login(e.username, e.password);
+    emit(AuthAuthenticated(user));
+  } catch (err) {
+    emit(AuthError(err.toString()));
+  }
+});
+```
+
+Inject repository in constructor for testability.
+
+## Testing blocs
+- Inject repositories to mock easily.
+- Prefer asserting emitted state sequences (observable behavior).
+- Use bloc_test and mocktail.
+
+Example:
+```dart
+blocTest<AuthBloc, AuthState>(
+  'emits [AuthLoading, AuthAuthenticated] when login succeeds',
+  build: () {
+    when(() => repo.login('u','p')).thenAnswer((_) async => User(id: '1'));
+    return AuthBloc(repo);
+  },
+  act: (b) => b.add(LoginRequested('u','p')),
+  expect: () => [isA<AuthLoading>(), isA<AuthAuthenticated>()],
+);
+```
+
+For widget/integration tests, use real blocs for realistic flows or fakes to isolate UI.
+
+## Dependency injection & wiring
+get_it example:
+```dart
+final g = GetIt.instance;
+
+void setup() {
+  g.registerLazySingleton<AuthRepository>(() => AuthRepositoryImpl());
+  g.registerFactory(() => AuthBloc(g<AuthRepository>()));
+}
+
+// In widget tree
+MultiBlocProvider(
+  providers: [
+    BlocProvider(create: (_) => g<AuthBloc>()),
+  ],
+  child: MyApp(),
+);
+```
+
+Guidelines:
+- App-level singletons for long-lived services; feature-level providers for page-scoped blocs.
+- Beware hot reload preserving singletons; provide reset methods for tests/dev workflows.
+
+## Debugging & observability
+- Implement BlocObserver for logging transitions and errors.
+```dart
+class SimpleObserver extends BlocObserver {
+  @override
+  void onTransition(Bloc bloc, Transition transition) {
+    print(transition);
+    super.onTransition(bloc, transition);
+  }
+  @override
+  void onError(BlocBase bloc, Object error, StackTrace stackTrace) {
+    print(error);
+    super.onError(bloc, error, stackTrace);
+  }
+}
+```
+- Integrate with Sentry/Crashlytics and DevTools.
+- Instrument event frequency and timestamps to locate hot paths.
+
+## Migration & team conventions
+- Incremental migration: convert one feature, validate tests and performance.
+- Conventions: FeatureEvent/FeatureState, file templates, base classes for repeated patterns.
+- Code review checklist: side effects in listeners or repositories, tests cover success/error, state is granular, no blocking work in handlers.
+
+## Common mistakes (short)
+- Business logic or I/O in widgets.
+- Monolithic state forcing unrelated rebuilds.
+- Not using value equality -> redundant rebuilds.
+- Overusing events (too chatty) or one mega-event.
+- Performing UI side effects in handlers (use listeners).
+- Blocking main isolate.
+- Persisting sensitive data without encryption.
+- Tests that assert implementation details instead of emitted states.
+
+## Tradeoffs & conclusion
+Bloc enforces explicit, testable flows at the cost of boilerplate. Use it when the complexity and testability needs justify that structure. Combine approaches: Bloc for complex features, simple alternatives for trivial UI state.
+
+Follow these practices:
+- Keep states immutable and granular.
+- Put I/O in repositories, side effects in listeners.
+- Slice state with BlocSelector and keep builders shallow.
+- Test behavior via emitted states and instrument runtime for hot paths.
+
+This guide focuses on actionable patterns and pitfalls for production apps. Apply them feature-by-feature and measure impact.
